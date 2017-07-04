@@ -1,230 +1,182 @@
-import json
-import boto3
-from botocore.client import ClientError
 import random
 import uuid
 import time
+from contextlib import contextmanager
+import json
+
+import six
+
+from pyj.storage import get_storage_by_url
+
+PENDING_PREF = 'pending'
+QUEUED_PREF = 'queued'
+LOCK_PREF = 'lock'
+META_PREF = 'meta'
 
 
-BUCKET = 'test'
-PENDING_PREF = 'pending/'
-QUEUED_PREF = 'queued/'
-FINISHED_PREF = 'finished/'
-LOCK_PREF = 'lock/'
-S3 = None
-
-
-def _get_s3():
-    return boto3.client(
-        service_name='s3',
-        region_name='us-west-1',
-        endpoint_url='http://localhost:5000',
-    )
-
-
-def _get_ts():
-    return '%d' % int(time.time()*1000000)
-
-
-def _list_keys(prefix='', s3=None):
-    s3 = s3 or S3 or _get_s3()
-    return [
-        o['Key'][len(prefix):] for o in
-        s3.list_objects(Bucket=BUCKET,
-                        Prefix=prefix).get('Contents', [])]
-
-
-def _create_bucket_if_not_exists():
-    try:
-        S3.head_bucket(Bucket=BUCKET)
-    except ClientError as e:
-        if e.response['Error']['Code'] == '404':
-            S3.create_bucket(Bucket=BUCKET)
+def _merge_dicts(src, patch):
+    res = src.copy()
+    for k in set(src) | set(patch):
+        if k not in patch:
+            continue
+        elif (k in src and isinstance(src[k], dict)
+              and isinstance(patch[k], dict)):
+            res[k] = _merge_dicts(src[k], patch[k])
+        elif (k in src and isinstance(src[k], list)
+              and isinstance(patch[k], list)):
+            res[k].extend(patch[k])
+        elif k in src and patch[k] is None:
+            res.pop(k, None)
         else:
-            raise e
+            res[k] = patch[k]
+    return res
+
+@contextmanager
+def get_lock(storage, key):
+
+    locks = storage.list(prefix='/'.join((LOCK_PREF, key)))
+    locked = False
+    if not locks:
+        ts = '%d' % int(time.time() * 1E9)
+        storage.put(key='/'.join((LOCK_PREF, key, ts)), body='42')
+        lock = sorted(storage.list(prefix='/'.join((LOCK_PREF, key))))[0]
+        locked = lock == ts
+    yield locked
+    if locked:
+        locks = storage.list(prefix='/'.join((LOCK_PREF, key)))
+        for lock in locks:
+            storage.delete(key='/'.join((LOCK_PREF, key, lock)))
 
 
-def _get_object(Bucket, Key, defaul=None):
-    try:
-        return S3.get_object(Bucket=Bucket,
-                             Key=Key)['Body'].read().decode("utf-8")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
-            return defaul
+class Queue(object):
+
+    def __init__(self, store, maxqueued=0):
+        if isinstance(store, six.string_types):
+            self.storage = get_storage_by_url(store)
         else:
-            raise e
+            self.storage = store
+        self.maxqueued = maxqueued
+
+    def get(self, block=False, forced=True):
+        while True:
+            pending = self.storage.list(prefix=PENDING_PREF)
+            is_not_ready = (
+                not pending or
+                0 < self.maxqueued <= len(self.storage.list(prefix=QUEUED_PREF))
+            )
+            if is_not_ready:
+                if block:
+                    time.sleep(1)
+                    continue
+                else:
+                    return None, None
+            jid = random.choice(pending)
+            with get_lock(self.storage, jid) as locked:
+                if locked:
+                    job = self.storage.get(key='/'.join((PENDING_PREF, jid)))
+                    if not forced:
+                        self.storage.put('/'.join((QUEUED_PREF, jid)), body=job)
+                    self.storage.delete('/'.join((PENDING_PREF, jid)))
+                    return jid, job
+
+    def put(self, job, jid=None):
+        jid = jid or uuid.uuid4().hex
+        self.storage.put(
+            key='/'.join((PENDING_PREF, jid)),
+            body=job
+        )
+        if jid:
+            self.storage.delete('/'.join((QUEUED_PREF, jid)))
+        return jid
+
+    def get_pending(self):
+        return {jid: self.storage.get(key='/'.join((PENDING_PREF, jid)))
+                for jid in self.storage.list(prefix=PENDING_PREF)}
+
+    def get_queued(self):
+        return {jid: self.storage.get(key='/'.join((QUEUED_PREF, jid)))
+                for jid in self.storage.list(prefix=QUEUED_PREF)}
+
+    def qsize(self):
+        return len(self.storage.list(prefix=PENDING_PREF))
+
+    def empty(self):
+        return self.qsize() == 0
+
+    def delete(self, jid):
+        self.storage.delete(key='/'.join((PENDING_PREF, jid)))
+        self.storage.delete(key='/'.join((QUEUED_PREF, jid)))
+
+    def drop(self):
+        for jid in self.storage.list(prefix=PENDING_PREF):
+            self.storage.delete(key='/'.join((PENDING_PREF, jid)))
+        for jid in self.storage.list(prefix=QUEUED_PREF):
+            self.storage.delete(key='/'.join((QUEUED_PREF, jid)))
 
 
-def backfill_jobs(jobs, s3=None):
-    s3 = s3 or S3 or _get_s3()
-    for j in jobs:
-        s3.put_object(Bucket=BUCKET,
-                      Key='%s%s' % (PENDING_PREF, uuid.uuid4().hex),
-                      Body=j)
+class MetaStore(object):
+    def __init__(self,store):
+        if isinstance(store, six.string_types):
+            self.storage = get_storage_by_url(store)
+        else:
+            self.storage = store
+        self.meta_base_key = '/'.join((META_PREF, 'base'))
+        self.meta_updates_key = '/'.join((META_PREF, 'updates'))
 
+    def drop(self):
+        self.storage.put(Key=self.meta_base_key, Body='')
+        all_updates = self._list_updates()
+        for ts in all_updates:
+            self.storage.delete_object(key='%s/%s' % (self.meta_updates_key, ts))
 
-def report_result(jid, exit_code):
-    S3.put_object(Bucket=BUCKET,
-                  Key='%s%s' % (FINISHED_PREF, jid),
-                  Body=json.dumps({'exit_code': exit_code,
-                                   'job': get_job(jid)}))
-    S3.delete_object(Bucket=BUCKET, Key='%s%s' % (QUEUED_PREF, jid))
+    def get(self):
+        meta, _, _ = self._get()
+        return meta
 
+    def update(self, patch, squash_if_needed=False):
+        key = '%s/%s' % (self.meta_updates_key, int(time.time() * 1E9))
+        self.storage.put(key, body=json.dumps(patch))
+        if squash_if_needed and len(self._list_updates()) > 42:
+            self.squash_updates()
 
-def get_result(jid, s3=None):
-    res = _get_object(Bucket=BUCKET,
-                      Key='%s%s' % (FINISHED_PREF, jid))
-    if res:
-        return json.loads(res)
-
-
-def get_job(jid):
-    job = _get_object(Bucket=BUCKET, Key=''.join((PENDING_PREF, jid)))
-    if job:
-        return job
-    job = _get_object(Bucket=BUCKET, Key=''.join((QUEUED_PREF, jid)))
-    if job:
-        return job
-    result = _get_object(Bucket=BUCKET, Key=''.join((FINISHED_PREF, jid)))
-    if result:
-        return result['job']
-
-
-def get_pending():
-    return _list_keys(prefix=PENDING_PREF)
-
-
-def get_queued():
-    return _list_keys(prefix=QUEUED_PREF)
-
-
-def get_finished():
-    return _list_keys(prefix=FINISHED_PREF)
-
-
-def pick_job():
-    while True:
-        pending = _list_keys(prefix=PENDING_PREF)
-        if not pending:
-            return None, None
-        jid = random.choice(pending)
-        if aquire_lock(jid):
-            job = get_job(jid)
-            move_job_to_queued(jid)
-            release_lock(jid)
-            return jid, job
-
-
-def move_job_to_queued(jid):
-    S3.copy_object(Bucket=BUCKET, Key='%s%s' % (QUEUED_PREF, jid),
-                   CopySource=dict(Bucket=BUCKET,
-                                   Key='%s%s' % (PENDING_PREF, jid)))
-    S3.delete_object(Bucket=BUCKET, Key='%s%s' % (PENDING_PREF, jid))
-
-
-def delete_job(jid):
-    S3.delete_object(Bucket=BUCKET, Key='%s%s' % (QUEUED_PREF, jid))
-    S3.delete_object(Bucket=BUCKET, Key='%s%s' % (PENDING_PREF, jid))
-    S3.delete_object(Bucket=BUCKET, Key='%s%s' % (FINISHED_PREF, jid))
-
-
-def aquire_lock(jid, s3=None):
-    s3 = s3 or S3 or _get_s3()
-    locks = _list_keys(prefix='%s%s/' % (LOCK_PREF, jid))
-    if locks:
-        return False
-    ts = _get_ts()
-    s3.put_object(Bucket=BUCKET, Key='%s%s/%s' % (LOCK_PREF, jid, ts), Body='42')
-    lock = sorted(_list_keys(prefix='%s%s/' % (LOCK_PREF, jid)))[0]
-    if lock == ts:
-        return True
-
-
-def release_lock(jid, s3=None):
-    s3 = s3 or S3 or _get_s3()
-    locks = _list_keys(prefix='%s%s/' % (LOCK_PREF, jid))
-    for lock in locks:
-        s3.delete_object(Bucket=BUCKET, Key='%s%s/%s' % (LOCK_PREF, jid, lock))
-
-
-if __name__ == '__main__':
-    import click
-
-    @click.group()
-    def cli():
-        pass
-
-    @click.command()
-    @click.argument('jobs', nargs=-1)
-    def put(jobs):
-        _create_bucket_if_not_exists()
-        backfill_jobs(jobs)
-
-    @click.command()
-    @click.argument('job_id', nargs=1)
-    @click.argument('exit_code', nargs=1)
-    def report(job_id, exit_code):
-        report_result(job_id, exit_code)
-
-
-    @click.command()
-    @click.option('-v', is_flag=True)
-    def get(v):
-        jid, job = pick_job()
-        if jid is None:
+    def squash_updates(self):
+        meta, updates, _ = self._get()
+        if not updates:
             return
-        if v:
-            print('\t'.join((jid, job)))
-        else:
-            print(job)
+        latest_update_ts = updates[-1][0]
+        serialized = json.dumps((latest_update_ts, meta))
+        self.storage.put(self.meta_base_key, body=serialized)
+        for _ts, _ in updates:
+            self.storage.delete(key='%s/%s' % (self.meta_updates_key, _ts))
 
-    @click.command()
-    @click.option('-v', is_flag=True)
-    def pending(v):
-        for jid in get_pending():
-            if v:
-                print('\t'.join((jid, get_job(jid))))
-            else:
-                print(get_job(jid))
+    def _get_base(self):
+        raw_base = self.storage.get(self.meta_base_key, default='')
+        return json.loads(raw_base) if raw_base else (None, {})
 
-    @click.command()
-    @click.option('-v', is_flag=True)
-    def queued(v):
-        for jid in get_queued():
-            if v:
-                print('\t'.join((jid, get_job(jid))))
-            else:
-                print(get_job(jid))
+    def _list_updates(self):
+        return self.storage.list(self.meta_updates_key)
 
-    @click.command()
-    @click.option('--job', is_flag=True)
-    @click.option('--exit_code', is_flag=True)
-    @click.option('-a', is_flag=True)
-    def finished(job, exit_code, a):
-        for jid in get_finished():
-            result = get_result(jid)
-            res = [jid]
-            if a or exit_code:
-                res.append(result['exit_code'])
-            if a or job:
-                res.append(result['job'])
-            print('\t'.join(res))
+    def _get_updates(self):
+        upd_keys = self._list_updates()
+        timestamps = []
+        updates = {}
+        for key in upd_keys:
+            upd_ts = key.split('/')[-1]
+            raw_update = self.storage.get('%s/%s' % (self.meta_updates_key, key), default='')
+            upd = json.loads(raw_update) if raw_update else {}
+            updates[upd_ts] = upd
+            timestamps.append(upd_ts)
+        return [(t, updates[t]) for t in sorted(timestamps)]
 
+    def _get(self):
+        updates = self._get_updates()
+        ts, meta = self._get_base()
+        meta = self._apply_updates(meta, updates, ts=ts)
+        return meta, updates, ts
 
-    @click.command()
-    def drop():
-        for jid in get_pending() + get_queued() + get_finished():
-            delete_job(jid)
-
-
-    cli.add_command(put)
-    cli.add_command(get)
-    cli.add_command(pending)
-    cli.add_command(queued)
-    cli.add_command(finished)
-    cli.add_command(report)
-    cli.add_command(drop)
-
-    S3 = _get_s3()
-
-    cli()
+    def _apply_updates(self, meta, updates, ts=None):
+        for upd_ts, patch in updates:
+            if (ts is not None) and (upd_ts < ts):
+                continue
+            meta = _merge_dicts(meta, patch=patch)
+        return meta
