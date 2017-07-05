@@ -4,6 +4,7 @@ import click
 import six
 import yaml
 import json
+import objectpath
 
 from pyj.storage import get_storage_by_url
 from pyj.pyj import Queue, MetaStore
@@ -91,9 +92,13 @@ def drop():
 
 
 @click.command()
-def meta_get():
+@click.option('-q', default=None)
+def meta_get(q):
     meta = MetaStore(_get_store()).get()
-    print(json.dumps(meta, indent=4))
+    if q:
+        print(json.dumps(objectpath.Tree(meta).execute(q), indent=4))
+    else:
+        print(json.dumps(meta, indent=4))
 
 
 @click.argument('update', default='')
@@ -110,6 +115,7 @@ def meta_upd(update, file):
 
 cli.add_command(put)
 cli.add_command(get)
+cli.add_command(left)
 cli.add_command(pending)
 cli.add_command(queued)
 cli.add_command(init)
