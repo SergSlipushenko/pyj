@@ -14,14 +14,14 @@ LOCK_PREF = 'lock'
 META_PREF = 'meta'
 
 
-def _merge_dicts(src, patch):
+def merge(src, patch):
     res = src.copy()
     for k in set(src) | set(patch):
         if k not in patch:
             continue
         elif (k in src and isinstance(src[k], dict)
               and isinstance(patch[k], dict)):
-            res[k] = _merge_dicts(src[k], patch[k])
+            res[k] = merge(src[k], patch[k])
         elif (k in src and isinstance(src[k], list)
               and isinstance(patch[k], list)):
             res[k].extend(patch[k])
@@ -124,10 +124,10 @@ class MetaStore(object):
         self.meta_updates_key = '/'.join((META_PREF, 'updates'))
 
     def drop(self):
-        self.storage.put(Key=self.meta_base_key, Body='')
+        self.storage.put(key=self.meta_base_key, body='')
         all_updates = self._list_updates()
         for ts in all_updates:
-            self.storage.delete_object(key='%s/%s' % (self.meta_updates_key, ts))
+            self.storage.delete(key='%s/%s' % (self.meta_updates_key, ts))
 
     def get(self):
         meta, _, _ = self._get()
@@ -178,5 +178,5 @@ class MetaStore(object):
         for upd_ts, patch in updates:
             if (ts is not None) and (upd_ts < ts):
                 continue
-            meta = _merge_dicts(meta, patch=patch)
+            meta = merge(meta, patch=patch)
         return meta
